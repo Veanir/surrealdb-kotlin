@@ -1,4 +1,4 @@
-name: CI/CD Pipeline
+name: SurrealDB Driver CI
 
 on:
   push:
@@ -9,37 +9,22 @@ on:
       - main
 
 jobs:
-  build-and-test:
+  test:
     runs-on: ubuntu-latest
-
-    services:
-      surrealdb:
-        image: surrealdb/surrealdb:latest
-        ports:
-          - 8000:8000
-        env:
-          SURREAL_USER: root
-          SURREAL_PASS: root
-
     steps:
-      - name: Checkout code
+      # Checkout the repository
+      - name: Git Checkout
         uses: actions/checkout@v4
 
+      # Set up JDK 21
       - name: Set up JDK 21
         uses: actions/setup-java@v4
         with:
           java-version: '21'
-          distribution: 'temurin'
-      - name: Start surrealDB
-        run: surreal start --user root --pass root memory
+          distribution: 'temurin' # Eclipse Temurin is a popular JDK distribution
 
-      - name: Wait for SurrealDB
-        run: sleep 10
-
-      - name: SurrealDB healthcheck
-        run: curl -f http://localhost:8000/health || exit 1
-
-      - name: Cache Gradle packages
+      # Cache Gradle dependencies to speed up builds
+      - name: Cache Gradle Packages
         uses: actions/cache@v3
         with:
           path: |
@@ -49,18 +34,32 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-gradle-
 
-      - name: Make gradlew executable
+      # Start SurrealDB
+      - name: Start SurrealDB
+        uses: surrealdb/setup-surreal@v2
+        with:
+          surrealdb_version: latest
+          surrealdb_port: 8000
+          surrealdb_username: root
+          surrealdb_password: root
+          surrealdb_auth: false
+          surrealdb_strict: false
+          surrealdb_log: info
+          surrealdb_additional_args: --allow-all
+          surrealdb_retry_count: 30
+
+      # Ensure Gradle is executable
+      - name: Make Gradle Wrapper Executable
         run: chmod +x ./gradlew
 
-      - name: Build with Gradle
-        run: ./gradlew build
-
-      - name: Run tests
+      # Run tests with Gradle
+      - name: Run Tests
         run: ./gradlew test --info
 
-      - name: Upload test results
-        if: always()
+      # Upload test results as an artifact (optional)
+      - name: Upload Test Results
+        if: always() # Upload even if tests fail
         uses: actions/upload-artifact@v4
         with:
           name: test-results
-          path: build/test-results/test/
+          path: build/test-results/**/*.xml
