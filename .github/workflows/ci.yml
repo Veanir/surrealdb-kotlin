@@ -1,0 +1,72 @@
+name: CI/CD Pipeline
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+
+    services:
+      # Start SurrealDB as a service for integration tests
+      surrealdb:
+        image: surrealdb/surrealdb:latest
+        ports:
+          - 8000:8000
+        env:
+          SURREAL_USER: root
+          SURREAL_PASS: root
+        options: >-
+          --health-cmd "curl -f http://localhost:8000/health || exit 1"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+        command: start --user root --pass root
+
+    steps:
+      # Checkout the repository
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      # Set up JDK 21 instead of 17
+      - name: Set up JDK 21
+        uses: actions/setup-java@v4
+        with:
+          java-version: '21'  # Updated to JDK 21
+          distribution: 'temurin' # Eclipse Temurin distribution
+
+      # Cache Gradle dependencies to speed up builds
+      - name: Cache Gradle packages
+        uses: actions/cache@v3
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          key: ${{ runner.os }}-gradle-${{ hashFiles('**/*.gradle*', '**/gradle-wrapper.properties') }}
+          restore-keys: |
+            ${{ runner.os }}-gradle-
+
+      # Grant execute permission for gradlew
+      - name: Make gradlew executable
+        run: chmod +x ./gradlew
+
+      # Build the project
+      - name: Build with Gradle
+        run: ./gradlew build
+
+      # Run tests
+      - name: Run tests
+        run: ./gradlew test --info
+
+      # Upload test results (optional)
+      - name: Upload test results
+        if: always() # Run even if tests fail
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-results
+          path: build/test-results/test/
