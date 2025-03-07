@@ -24,9 +24,7 @@ jobs:
           --health-cmd "curl -f http://localhost:8000/health || exit 1"
           --health-interval 10s
           --health-timeout 5s
-          --health-retries 5
-          # Specify the command as part of the container run options
-          surreal start --user root --pass root memory
+          --health-retries 5    
 
     steps:
       - name: Checkout code
@@ -37,6 +35,14 @@ jobs:
         with:
           java-version: '21'
           distribution: 'temurin'
+      - name: Start surrealDB
+        run: surreal start --user root --pass root memory
+
+      - name: Wait for SurrealDB
+        run: sleep 10
+
+      - name: SurrealDB healthcheck
+        run: curl -f http://localhost:8000/health || exit 1
 
       - name: Cache Gradle packages
         uses: actions/cache@v3
