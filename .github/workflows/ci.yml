@@ -13,7 +13,6 @@ jobs:
     runs-on: ubuntu-latest
 
     services:
-      # Start SurrealDB as a service for integration tests
       surrealdb:
         image: surrealdb/surrealdb:latest
         ports:
@@ -26,22 +25,19 @@ jobs:
           --health-interval 10s
           --health-timeout 5s
           --health-retries 5
-          --entrypoint surreal start --user root --pass root
-          
+          # Specify the command as part of the container run options
+          surreal start --user root --pass root memory
 
     steps:
-      # Checkout the repository
       - name: Checkout code
         uses: actions/checkout@v4
 
-      # Set up JDK 21 instead of 17
       - name: Set up JDK 21
         uses: actions/setup-java@v4
         with:
-          java-version: '21'  # Updated to JDK 21
-          distribution: 'temurin' # Eclipse Temurin distribution
+          java-version: '21'
+          distribution: 'temurin'
 
-      # Cache Gradle dependencies to speed up builds
       - name: Cache Gradle packages
         uses: actions/cache@v3
         with:
@@ -52,21 +48,17 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-gradle-
 
-      # Grant execute permission for gradlew
       - name: Make gradlew executable
         run: chmod +x ./gradlew
 
-      # Build the project
       - name: Build with Gradle
         run: ./gradlew build
 
-      # Run tests
       - name: Run tests
         run: ./gradlew test --info
 
-      # Upload test results (optional)
       - name: Upload test results
-        if: always() # Run even if tests fail
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: test-results
