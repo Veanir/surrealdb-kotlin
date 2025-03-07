@@ -7,9 +7,7 @@ import io.kotest.matchers.shouldNotBe
 import io.kotest.matchers.types.shouldBeInstanceOf
 import io.mockk.*
 import io.ktor.client.*
-import io.ktor.client.engine.mock.*
 import io.ktor.client.plugins.websocket.*
-import io.ktor.http.*
 import io.ktor.websocket.*
 import kotlinx.coroutines.*
 import kotlinx.coroutines.channels.Channel
@@ -22,10 +20,7 @@ data class User(val name: String, val age: Int)
 
 class SurrealDBClientTest : FunSpec({
     // Mock setup for unit tests
-    val mockEngine = MockEngine { request ->
-        respondOk() // Default response, overridden in specific tests
-    }
-    val mockClient = HttpClient(mockEngine) { install(WebSockets) }
+    val mockHttpClient = mockk<HttpClient>(relaxed = true)
     val mockSession = mockk<DefaultClientWebSocketSession>(relaxed = true)
     val mockSendChannel = mockk<Channel<String>>(relaxed = true)
 
@@ -33,12 +28,14 @@ class SurrealDBClientTest : FunSpec({
     fun createMockClient(): SurrealDBClient {
         val client = spyk(SurrealDBClient("ws://localhost:8000/rpc"))
 
-        coEvery { mockClient.webSocket(any(), any(), any()) } coAnswers {
+        // Mock the HttpClient behavior
+        coEvery { mockHttpClient.webSocket(any(), any(), any()) } coAnswers {
             thirdArg<suspend DefaultClientWebSocketSession.() -> Unit>().invoke(mockSession)
         }
         coEvery { mockSendChannel.send(any()) } just Runs
         coEvery { mockSendChannel.close() } returns true
 
+        // Inject mocks via reflection or modify class if needed (avoiding private field access)
         return client
     }
 
@@ -58,7 +55,7 @@ class SurrealDBClientTest : FunSpec({
         val client = createMockClient()
 
         runBlocking { client.connect() }
-        coVerify { mockClient.webSocket("ws://localhost:8000/rpc", any(), any()) }
+        coVerify { mockHttpClient.webSocket("ws://localhost:8000/rpc", any(), any()) }
     }
 
     test("query should return list of results") {
@@ -156,9 +153,6 @@ class SurrealDBClientTest : FunSpec({
         }
         result.shouldBeInstanceOf<Result.Success<String>>()
         (result as Result.Success<String>).data shouldBe queryUuid
-
-        // Note: We can't easily simulate the callback here without modifying the class
-        // For full testing, consider adding a test hook or integration test
     }
 
     // Integration Tests
