@@ -165,6 +165,7 @@ class SurrealDBClient(private val config: SurrealDBClientConfig) {
         val deferred = CompletableDeferred<JsonElement>()
         synchronized(pendingRequests) { pendingRequests[requestId] = deferred }
         try {
+            log("Sending request $request")
             sendChannel.send(request.toString())
         } catch (e: Exception) {
             synchronized(pendingRequests) { pendingRequests.remove(requestId) }
