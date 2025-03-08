@@ -51,14 +51,21 @@ object BytesSerializer : KSerializer<SurrealBytes> {
 @Serializable(with = DatetimeSerializer::class)
 data class SurrealDatetime(val value: OffsetDateTime) : SurrealType {
     companion object {
-        val FORMATTER: DateTimeFormatter = DateTimeFormatter.ofPattern("yyyy-MM-dd'T'HH:mm:ssXXX")
+        val FORMATTER: DateTimeFormatter = DateTimeFormatter.ISO_OFFSET_DATE_TIME
     }
 }
 
 object DatetimeSerializer : KSerializer<SurrealDatetime> {
     override val descriptor = PrimitiveSerialDescriptor("SurrealDatetime", PrimitiveKind.STRING)
-    override fun serialize(encoder: Encoder, value: SurrealDatetime) = encoder.encodeString(value.value.format(SurrealDatetime.FORMATTER))
-    override fun deserialize(decoder: Decoder): SurrealDatetime = SurrealDatetime(OffsetDateTime.parse(decoder.decodeString(), SurrealDatetime.FORMATTER))
+    override fun serialize(encoder: Encoder, value: SurrealDatetime) {
+        val formatted = value.value.format(SurrealDatetime.FORMATTER)
+        encoder.encodeString("d\"$formatted\"") // e.g., d"2025-03-08T20:41:03.401851Z"
+    }
+    override fun deserialize(decoder: Decoder): SurrealDatetime {
+        val string = decoder.decodeString()
+        val cleanedString = string.removePrefix("d\"").removeSuffix("\"")
+        return SurrealDatetime(OffsetDateTime.parse(cleanedString, SurrealDatetime.FORMATTER))
+    }
 }
 
 @Serializable(with = DecimalSerializer::class)
