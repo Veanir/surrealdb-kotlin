@@ -6,30 +6,71 @@ import io.ktor.client.plugins.websocket.*
 import io.ktor.websocket.*
 import kotlinx.coroutines.*
 import kotlinx.coroutines.channels.Channel
+import kotlinx.coroutines.channels.awaitClose
 import kotlinx.coroutines.channels.consumeEach
+import kotlinx.coroutines.channels.onFailure
+import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.callbackFlow
 import kotlinx.serialization.InternalSerializationApi
+import kotlinx.serialization.Serializable
 import kotlinx.serialization.builtins.ListSerializer
 import kotlinx.serialization.json.*
 import kotlinx.serialization.serializer
 import java.util.concurrent.atomic.AtomicInteger
 import kotlin.reflect.KClass
 
+/**
+ * Configuration for the SurrealDB client.
+ */
+data class SurrealDBClientConfig(
+    var url: String = "ws://localhost:8000/rpc",
+    var namespace: String? = null,
+    var database: String? = null,
+    var credentials: SignInParams? = null,
+    var verboseLogging: Boolean = false
+)
+
+/**
+ * Scope utility to manage the client lifecycle.
+ */
+fun <T> withSurrealDB(config: SurrealDBClientConfig, block: suspend SurrealDBClient.() -> T): T {
+    val client = SurrealDBClient(config)
+    return runBlocking {
+        try {
+            client.connect()
+            config.credentials?.let { client.signin(it).getOrThrow() }
+            config.namespace?.let { ns -> config.database?.let { db -> client.use(ns, db).getOrThrow() } }
+            client.block()
+        } finally {
+            client.disconnect()
+        }
+    }
+}
+
+/**
+ * The concrete SurrealDB client implementation.
+ */
 @OptIn(InternalSerializationApi::class)
-internal class SurrealDBClient(private val url: String) : SurrealDB {
+class SurrealDBClient(private val config: SurrealDBClientConfig) {
     private val client = HttpClient(CIO) { install(WebSockets) }
     private val requestIdCounter = AtomicInteger(0)
     private val pendingRequests = mutableMapOf<Int, CompletableDeferred<JsonElement>>()
     private val liveQueryCallbacks = mutableMapOf<String, (JsonElement) -> Unit>()
-    private val sendChannel = Channel<String>(capacity = Channel.UNLIMITED)
+    private val sendChannel = Channel<String>(capacity = 100)
     private var webSocketSession: DefaultClientWebSocketSession? = null
     private var connectionJob: Job? = null
     internal val json = Json { ignoreUnknownKeys = true }
 
-    override suspend fun connect() {
-        connectionJob = CoroutineScope(Dispatchers.IO).launch {
+    private fun log(message: String) { if (config.verboseLogging) println(message) }
+
+    suspend fun connect() {
+        connectionJob = CoroutineScope(Dispatchers.IO + CoroutineExceptionHandler { _, e ->
+            log("Connection coroutine exception: $e")
+        }).launch {
             try {
-                client.webSocket(url) {
+                client.webSocket(config.url) {
                     webSocketSession = this
+                    log("WebSocket connection established to ${config.url}")
                     launch {
                         for (message in sendChannel) {
                             send(message)
@@ -40,30 +81,55 @@ internal class SurrealDBClient(private val url: String) : SurrealDB {
                     }
                 }
             } catch (e: Exception) {
-                throw DatabaseException("Failed to connect to SurrealDB at $url: ${e.message}")
+                if (e !is CancellationException) {
+                    throw DatabaseException("Failed to connect to ${config.url}", e)
+                }
             }
         }
-        delay(100)
+        // Wait for connection to establish with a timeout
+        try {
+            withTimeout(1000) {
+                while (webSocketSession == null && connectionJob?.isActive == true) delay(10)
+                if (webSocketSession == null) throw DatabaseException("Connection timed out")
+            }
+        } catch (e: TimeoutCancellationException) {
+            disconnect() // Cleanup on timeout
+            throw DatabaseException("Failed to connect to ${config.url}: Timeout", e)
+        }
     }
 
-    override suspend fun disconnect() {
-        connectionJob?.cancelAndJoin()
-        webSocketSession?.close()
-        sendChannel.close()
-        synchronized(pendingRequests) { pendingRequests.clear() }
-        synchronized(liveQueryCallbacks) { liveQueryCallbacks.clear() }
-        client.close()
+    suspend fun disconnect() {
+        try {
+            connectionJob?.let {
+                if (it.isActive) {
+                    it.cancel("Disconnecting client")
+                    it.join() // Wait for cancellation to complete
+                }
+            }
+            webSocketSession?.close(CloseReason(CloseReason.Codes.NORMAL, "Client disconnect"))
+            sendChannel.close()
+            synchronized(pendingRequests) { pendingRequests.clear() }
+            synchronized(liveQueryCallbacks) { liveQueryCallbacks.clear() }
+            client.close()
+            log("Disconnected from ${config.url}")
+        } catch (e: Exception) {
+            log("Error during disconnect: ${e.message}")
+        } finally {
+            webSocketSession = null
+            connectionJob = null
+        }
     }
 
     private fun handleMessage(message: String) {
         try {
+            log("Received WebSocket message: $message")
             val jsonElement = json.parseToJsonElement(message)
             when {
                 jsonElement is JsonObject && jsonElement.containsKey("id") -> {
                     val id = jsonElement["id"]?.jsonPrimitive?.intOrNull ?: return
                     val result = jsonElement["result"] ?: JsonNull
                     val error = jsonElement["error"]
-                    val deferred = pendingRequests.remove(id) ?: return
+                    val deferred = synchronized(pendingRequests) { pendingRequests.remove(id) } ?: return
                     if (error != null && error != JsonNull) {
                         val errorMessage = error.jsonObject["message"]?.jsonPrimitive?.content ?: error.toString()
                         deferred.completeExceptionally(DatabaseException("RPC error: $errorMessage"))
@@ -71,14 +137,17 @@ internal class SurrealDBClient(private val url: String) : SurrealDB {
                         deferred.complete(result)
                     }
                 }
-                jsonElement is JsonObject && jsonElement.containsKey("queryUuid") -> {
-                    val queryUuid = jsonElement["queryUuid"]?.jsonPrimitive?.content ?: return
-                    val data = jsonElement["data"] ?: JsonNull
-                    liveQueryCallbacks[queryUuid]?.invoke(data)
+                jsonElement is JsonObject && jsonElement.containsKey("result") -> {
+                    val resultObj = jsonElement["result"]?.jsonObject ?: return
+                    val queryUuid = resultObj["id"]?.jsonPrimitive?.content ?: return
+                    val data = resultObj["result"] ?: JsonNull
+                    log("Live query message received: $jsonElement")
+                    synchronized(liveQueryCallbacks) { liveQueryCallbacks[queryUuid] }?.invoke(data)
                 }
+                else -> log("Unhandled message type: $jsonElement")
             }
         } catch (e: Exception) {
-            // Log or ignore malformed messages
+            log("Error parsing message: $message, exception: $e")
         }
     }
 
@@ -95,7 +164,7 @@ internal class SurrealDBClient(private val url: String) : SurrealDB {
             sendChannel.send(request.toString())
         } catch (e: Exception) {
             synchronized(pendingRequests) { pendingRequests.remove(requestId) }
-            throw DatabaseException("Failed to send RPC request '$method': ${e.message}")
+            throw DatabaseException("Failed to send RPC request '$method': ${e.message}", e)
         }
         return deferred.await()
     }
@@ -109,367 +178,578 @@ internal class SurrealDBClient(private val url: String) : SurrealDB {
     }
 
     // Session Management
-    override suspend fun use(namespace: String?, database: String?): Result<JsonElement> {
+    suspend fun use(namespace: String? = null, database: String?): Result<JsonElement> = try {
         val paramsJson = buildJsonArray {
             add(namespace?.let { JsonPrimitive(it) } ?: JsonNull)
             add(database?.let { JsonPrimitive(it) } ?: JsonNull)
         }
-        return try {
-            val result = sendRpcRequest("use", paramsJson)
-            Result.Success(result)
-        } catch (e: Exception) {
-            Result.Error(DatabaseException("Failed to set namespace/database: ${e.message}"))
-        }
+        Result.Success(sendRpcRequest("use", paramsJson))
+    } catch (e: Exception) {
+        Result.Error(DatabaseException("Failed to set namespace/database: ${e.message}", e))
     }
 
-    override suspend fun info(): Result<JsonElement> {
-        return try {
-            val result = sendRpcRequest("info", JsonArray(emptyList()))
-            Result.Success(result)
-        } catch (e: Exception) {
-            Result.Error(DatabaseException("Failed to retrieve info: ${e.message}"))
-        }
+    suspend fun info(): Result<JsonElement> = try {
+        Result.Success(sendRpcRequest("info", JsonArray(emptyList())))
+    } catch (e: Exception) {
+        Result.Error(DatabaseException("Failed to retrieve info: ${e.message}", e))
     }
 
-    override suspend fun version(): Result<JsonElement> {
-        return try {
-            val result = sendRpcRequest("version", JsonArray(emptyList()))
-            Result.Success(result)
-        } catch (e: Exception) {
-            Result.Error(DatabaseException("Failed to retrieve version: ${e.message}"))
-        }
+    suspend fun version(): Result<JsonElement> = try {
+        Result.Success(sendRpcRequest("version", JsonArray(emptyList())))
+    } catch (e: Exception) {
+        Result.Error(DatabaseException("Failed to retrieve version: ${e.message}", e))
     }
 
     // Authentication
-    override suspend fun signup(params: SignUpParams): Result<String?> {
+    suspend fun signup(params: SignUpParams): Result<String?> = try {
         val paramsJson = buildJsonArray { add(json.encodeToJsonElement(params)) }
-        return try {
-            val result = sendRpcRequest("signup", paramsJson)
-            Result.Success(if (result is JsonNull) null else result.jsonPrimitive.content)
-        } catch (e: Exception) {
-            Result.Error(AuthenticationException("Signup failed: ${e.message}"))
-        }
+        val result = sendRpcRequest("signup", paramsJson)
+        Result.Success(if (result is JsonNull) null else result.jsonPrimitive.content)
+    } catch (e: Exception) {
+        Result.Error(AuthenticationException("Signup failed: ${e.message}", e))
     }
 
-    override suspend fun signin(params: SignInParams): Result<String?> {
+    suspend fun signin(params: SignInParams): Result<String?> = try {
         val paramsJson = buildJsonArray { add(json.encodeToJsonElement(params)) }
-        return try {
-            val result = sendRpcRequest("signin", paramsJson)
-            Result.Success(if (result is JsonNull) null else result.jsonPrimitive.content)
-        } catch (e: Exception) {
-            Result.Error(AuthenticationException("Signin failed: ${e.message}"))
-        }
+        val result = sendRpcRequest("signin", paramsJson)
+        Result.Success(if (result is JsonNull) null else result.jsonPrimitive.content)
+    } catch (e: Exception) {
+        Result.Error(AuthenticationException("Signin failed: ${e.message}", e))
     }
 
-    override suspend fun authenticate(token: String): Result<Unit> {
+    suspend fun authenticate(token: String): Result<Unit> = try {
         val paramsJson = buildJsonArray { add(JsonPrimitive(token)) }
-        return try {
-            sendRpcRequest("authenticate", paramsJson)
-            Result.Success(Unit)
-        } catch (e: Exception) {
-            Result.Error(AuthenticationException("Authentication failed: ${e.message}"))
-        }
+        sendRpcRequest("authenticate", paramsJson)
+        Result.Success(Unit)
+    } catch (e: Exception) {
+        Result.Error(AuthenticationException("Authentication failed: ${e.message}", e))
     }
 
-    override suspend fun invalidate(): Result<Unit> {
-        return try {
-            sendRpcRequest("invalidate", JsonArray(emptyList()))
-            Result.Success(Unit)
-        } catch (e: Exception) {
-            Result.Error(DatabaseException("Failed to invalidate session: ${e.message}"))
-        }
+    suspend fun invalidate(): Result<Unit> = try {
+        sendRpcRequest("invalidate", JsonArray(emptyList()))
+        Result.Success(Unit)
+    } catch (e: Exception) {
+        Result.Error(DatabaseException("Failed to invalidate session: ${e.message}", e))
     }
 
-    // Variables
-    override suspend fun let(name: String, value: JsonElement): Result<Unit> {
+    // Variable Management
+    suspend fun let(name: String, value: JsonElement): Result<Unit> = try {
         val paramsJson = buildJsonArray {
             add(JsonPrimitive(name))
             add(value)
         }
-        return try {
-            sendRpcRequest("let", paramsJson)
-            Result.Success(Unit)
-        } catch (e: Exception) {
-            Result.Error(DatabaseException("Failed to set variable '$name': ${e.message}"))
-        }
+        sendRpcRequest("let", paramsJson)
+        Result.Success(Unit)
+    } catch (e: Exception) {
+        Result.Error(DatabaseException("Failed to set variable '$name': ${e.message}", e))
     }
 
-    override suspend fun unset(name: String): Result<Unit> {
+    suspend fun unset(name: String): Result<Unit> = try {
         val paramsJson = buildJsonArray { add(JsonPrimitive(name)) }
-        return try {
-            sendRpcRequest("unset", paramsJson)
-            Result.Success(Unit)
-        } catch (e: Exception) {
-            Result.Error(DatabaseException("Failed to unset variable '$name': ${e.message}"))
-        }
+        sendRpcRequest("unset", paramsJson)
+        Result.Success(Unit)
+    } catch (e: Exception) {
+        Result.Error(DatabaseException("Failed to unset variable '$name': ${e.message}", e))
     }
 
     // Live Queries
-    override suspend fun <T : Any> live(
+    suspend fun <T : Any> live(
         table: String,
         diff: Boolean,
         type: KClass<T>,
         callback: (Diff<T>) -> Unit
-    ): Result<String> {
+    ): Result<String> = try {
         val paramsJson = buildJsonArray {
             add(JsonPrimitive(table))
             add(JsonPrimitive(diff))
         }
-        return try {
-            val response = sendRpcRequest("live", paramsJson)
-            val queryUuid = response.jsonPrimitive.content
+        val response = sendRpcRequest("live", paramsJson)
+        val queryUuid = response.jsonPrimitive.content
+        registerLiveQueryCallback(queryUuid) { jsonData ->
+            val diffData = if (diff) {
+                val operation = jsonData.jsonObject["operation"]?.jsonPrimitive?.content ?: "update"
+                val path = jsonData.jsonObject["path"]?.jsonPrimitive?.content
+                val value = jsonData.jsonObject["value"]?.let { json.decodeFromJsonElement(type.serializer(), it) }
+                Diff(operation, path, value)
+            } else {
+                val userData = jsonData.takeIf { it !is JsonNull } ?: return@registerLiveQueryCallback
+                Diff("update", null, json.decodeFromJsonElement(type.serializer(), userData))
+            }
+            callback(diffData)
+        }
+        Result.Success(queryUuid)
+    } catch (e: Exception) {
+        Result.Error(QueryException("Failed to start live query: ${e.message}", e))
+    }
+
+    suspend fun <T : Any> live(
+        table: String,
+        diff: Boolean = false,
+        type: KClass<T>
+    ): Result<Flow<Diff<T>>> = try {
+        val paramsJson = buildJsonArray {
+            add(JsonPrimitive(table))
+            add(JsonPrimitive(diff))
+        }
+        val response = sendRpcRequest("live", paramsJson)
+        val queryUuid = response.jsonPrimitive.content
+        Result.Success(callbackFlow {
             registerLiveQueryCallback(queryUuid) { jsonData ->
-                if (diff) {
+                log("Raw live data: $jsonData")
+                val diffData = if (diff) {
                     val operation = jsonData.jsonObject["operation"]?.jsonPrimitive?.content ?: "update"
                     val path = jsonData.jsonObject["path"]?.jsonPrimitive?.content
                     val value = jsonData.jsonObject["value"]?.let { json.decodeFromJsonElement(type.serializer(), it) }
-                    callback(Diff(operation, path, value))
+                    Diff(operation, path, value)
                 } else {
-                    callback(Diff("update", null, json.decodeFromJsonElement(type.serializer(), jsonData)))
+                    val userData = jsonData.takeIf { it !is JsonNull } ?: return@registerLiveQueryCallback
+                    Diff("update", null, json.decodeFromJsonElement(type.serializer(), userData))
+                }
+                trySend(diffData).onFailure { throwable ->
+                    log("Failed to send diffData: $throwable")
                 }
             }
-            Result.Success(queryUuid)
-        } catch (e: Exception) {
-            Result.Error(QueryException("Failed to start live query: ${e.message}"))
-        }
+            awaitClose {
+                CoroutineScope(coroutineContext).launch {
+                    kill(queryUuid).getOrThrow()
+                }
+            }
+        })
+    } catch (e: Exception) {
+        Result.Error(QueryException("Failed to start live query: ${e.message}", e))
     }
 
-    override suspend fun kill(queryUuid: String): Result<Unit> {
+    suspend inline fun <reified T : Any> live(
+        table: String,
+        diff: Boolean = false
+    ): Result<Flow<Diff<T>>> = live(table, diff, T::class)
+
+    suspend inline fun <reified T : Any> live(
+        table: String,
+        diff: Boolean,
+        crossinline callback: (Diff<T>) -> Unit
+    ): Result<String> = live(table, diff, T::class) { callback(it) }
+
+    suspend fun kill(queryUuid: String): Result<Unit> = try {
         val paramsJson = buildJsonArray { add(JsonPrimitive(queryUuid)) }
-        return try {
-            sendRpcRequest("kill", paramsJson)
-            unregisterLiveQueryCallback(queryUuid)
-            Result.Success(Unit)
-        } catch (e: Exception) {
-            Result.Error(QueryException("Failed to kill live query: ${e.message}"))
-        }
+        sendRpcRequest("kill", paramsJson)
+        unregisterLiveQueryCallback(queryUuid)
+        Result.Success(Unit)
+    } catch (e: Exception) {
+        Result.Error(QueryException("Failed to kill live query: ${e.message}", e))
     }
 
-    override suspend fun <T : Any> query(
+    // Queries
+    suspend fun <T : Any> query(
         sql: String,
-        vars: Map<String, JsonElement>?,
-        type: KClass<T>,
-        lenient: Boolean
-    ): Result<out Any> {
+        vars: Map<String, JsonElement>? = null,
+        type: KClass<T>
+    ): Result<List<T>> = try {
         val paramsJson = buildJsonArray {
             add(JsonPrimitive(sql))
             add(JsonObject(vars ?: emptyMap()))
         }
-        return try {
-            val result = sendRpcRequest("query", paramsJson)
-            if (result !is JsonArray) throw QueryException("Expected array, got $result")
-            val listSerializer = ListSerializer(type.serializer())
-            val results = result.mapNotNull { it.jsonObject["result"] }
-                .map { json.decodeFromJsonElement(listSerializer, it) }
-                .flatten()
-            Result.Success(results)
-        } catch (e: Exception) {
-            if (lenient) Result.Success(sendRpcRequest("query", paramsJson))
-            else Result.Error(QueryException("Query '$sql' failed: ${e.message}"))
-        }
+        val result = sendRpcRequest("query", paramsJson)
+        if (result !is JsonArray) throw QueryException("Expected array, got $result")
+        val listSerializer = ListSerializer(type.serializer())
+        val results = result.mapNotNull { it.jsonObject["result"] }
+            .map { json.decodeFromJsonElement(listSerializer, it) }
+            .flatten()
+        Result.Success(results)
+    } catch (e: Exception) {
+        Result.Error(QueryException("Query failed: $sql with vars $vars", e))
     }
 
-    override suspend fun <T : Any> querySingle(
+    suspend inline fun <reified T : Any> query(
         sql: String,
-        vars: Map<String, JsonElement>?,
-        type: KClass<T>,
-        lenient: Boolean
-    ): Result<out Any> {
-        val queryResult = query(sql, vars, type, lenient)
-        return when (queryResult) {
-            is Result.Success -> {
-                when (val result = queryResult.data) {
-                    is List<*> -> when (result.size) {
-                        0 -> Result.Error(QueryException("Expected one result, got none"))
-                        1 -> {
-                            val first = result.first()
-                            if (first != null) Result.Success(first)
-                            else Result.Error(QueryException("First result was null"))
-                        }
-                        else -> Result.Error(QueryException("Expected one result, got ${result.size}"))
-                    }
-                    is JsonElement -> Result.Success(result) // Lenient mode
-                    else -> Result.Error(QueryException("Unexpected result type: $result"))
+        vars: Map<String, JsonElement>? = null
+    ): Result<List<T>> = query(sql, vars, T::class)
+
+    suspend fun queryRaw(
+        sql: String,
+        vars: Map<String, JsonElement>? = null
+    ): Result<List<JsonElement>> = try {
+        val paramsJson = buildJsonArray {
+            add(JsonPrimitive(sql))
+            add(JsonObject(vars ?: emptyMap()))
+        }
+        val result = sendRpcRequest("query", paramsJson)
+        if (result !is JsonArray) throw QueryException("Expected array, got $result")
+        val rawResults = result.mapNotNull { it.jsonObject["result"] }
+            .flatMap {
+                when (it) {
+                    is JsonArray -> it.toList()  // If "result" is an array, expand it
+                    else -> listOf(it)           // If "result" is a single element, wrap it in a list
                 }
             }
-            is Result.Error -> queryResult // Propagate the error
-        }
+        Result.Success(rawResults)
+    } catch (e: Exception) {
+        Result.Error(QueryException("Raw query failed: $sql with vars $vars", e))
     }
 
-    override suspend fun <T : Any> graphql(
+    suspend fun <T : Any> graphql(
         query: String,
-        options: Map<String, JsonElement>?,
+        options: Map<String, JsonElement>? = null,
         type: KClass<T>
-    ): Result<T> {
+    ): Result<T> = try {
         val paramsJson = buildJsonArray {
             add(JsonPrimitive(query))
             add(options?.let { JsonObject(it) } ?: JsonNull)
         }
-        return try {
-            val result = sendRpcRequest("graphql", paramsJson)
-            Result.Success(json.decodeFromJsonElement(type.serializer(), result))
-        } catch (e: Exception) {
-            Result.Error(QueryException("Failed to execute GraphQL query '$query': ${e.message}"))
-        }
+        val result = sendRpcRequest("graphql", paramsJson)
+        Result.Success(json.decodeFromJsonElement(type.serializer(), result))
+    } catch (e: Exception) {
+        Result.Error(QueryException("Failed to execute GraphQL query '$query': ${e.message}", e))
     }
 
-    override suspend fun <T : Any> run(
+    suspend inline fun <reified T : Any> graphql(
+        query: String,
+        options: Map<String, JsonElement>? = null
+    ): Result<T> = graphql(query, options, T::class)
+
+    suspend fun <T : Any> run(
         funcName: String,
-        version: String?,
+        version: String? = null,
         args: List<JsonElement>,
         type: KClass<T>
-    ): Result<T> {
+    ): Result<T> = try {
         val paramsJson = buildJsonArray {
             add(JsonPrimitive(funcName))
             add(version?.let { JsonPrimitive(it) } ?: JsonNull)
             add(JsonArray(args))
         }
-        return try {
-            val result = sendRpcRequest("run", paramsJson)
-            Result.Success(json.decodeFromJsonElement(type.serializer(), result))
-        } catch (e: Exception) {
-            Result.Error(QueryException("Failed to run function '$funcName': ${e.message}"))
-        }
+        val result = sendRpcRequest("run", paramsJson)
+        Result.Success(json.decodeFromJsonElement(type.serializer(), result))
+    } catch (e: Exception) {
+        Result.Error(QueryException("Failed to run function '$funcName': ${e.message}", e))
     }
+
+    suspend inline fun <reified T : Any> run(
+        funcName: String,
+        version: String? = null,
+        args: List<JsonElement>
+    ): Result<T> = run(funcName, version, args, T::class)
 
     // Data Manipulation
-    override suspend fun <T : Any> select(thing: RecordId, type: KClass<T>): Result<List<T>> {
+    suspend fun <T : Any> select(thing: RecordId, type: KClass<T>): Result<List<T>> = try {
         val paramsJson = buildJsonArray { add(JsonPrimitive(thing.toString())) }
-        return try {
-            val result = sendRpcRequest("select", paramsJson)
-            val listSerializer = ListSerializer(type.serializer())
-            Result.Success(if (result is JsonNull) emptyList() else json.decodeFromJsonElement(listSerializer, result))
-        } catch (e: Exception) {
-            Result.Error(QueryException("Failed to select from $thing: ${e.message}"))
+        val result = sendRpcRequest("select", paramsJson)
+        val listSerializer = ListSerializer(type.serializer())
+        val users = when (result) {
+            is JsonNull -> emptyList() // No records found
+            is JsonObject -> listOf(json.decodeFromJsonElement(type.serializer(), result)) // Single record
+            is JsonArray -> json.decodeFromJsonElement(listSerializer, result) // Multiple records
+            else -> throw DatabaseException("Unexpected response format for select: $result")
         }
+        Result.Success(users)
+    } catch (e: Exception) {
+        Result.Error(OperationException("Select failed on $thing", e))
     }
 
-    override suspend fun <T : Any> create(thing: RecordId, data: T?, type: KClass<T>): Result<T> {
+    suspend inline fun <reified T : Any> select(thing: RecordId): Result<List<T>> = select(thing, T::class)
+
+    suspend fun <T : Any> create(thing: RecordId, data: T? = null, type: KClass<T>): Result<T> = try {
         val paramsJson = buildJsonArray {
             add(JsonPrimitive(thing.toString()))
             add(data?.let { json.encodeToJsonElement(type.serializer(), it) } ?: JsonNull)
         }
-        return try {
-            val result = sendRpcRequest("create", paramsJson)
-            val record = json.decodeFromJsonElement(type.serializer(), if (result is JsonArray) result.first() else result)
-            Result.Success(record)
-        } catch (e: Exception) {
-            Result.Error(QueryException("Failed to create $thing: ${e.message}"))
-        }
+        val result = sendRpcRequest("create", paramsJson)
+        Result.Success(json.decodeFromJsonElement(type.serializer(), if (result is JsonArray) result.first() else result))
+    } catch (e: Exception) {
+        Result.Error(OperationException("Create failed on $thing", e))
     }
 
-    override suspend fun <T : Any> insert(thing: RecordId, data: List<T>, type: KClass<T>): Result<List<T>> {
+    suspend inline fun <reified T : Any> create(thing: RecordId, data: T? = null): Result<T> = create(thing, data, T::class)
+
+    suspend fun <T : Any> insert(table: String, data: List<T>, type: KClass<T>): Result<List<T>> = try {
         val paramsJson = buildJsonArray {
-            add(JsonPrimitive(thing.toString()))
+            add(JsonPrimitive(table))  // Just the table name, no id
             add(JsonArray(data.map { json.encodeToJsonElement(type.serializer(), it) }))
         }
-        return try {
-            val result = sendRpcRequest("insert", paramsJson)
-            Result.Success(json.decodeFromJsonElement(ListSerializer(type.serializer()), result))
-        } catch (e: Exception) {
-            Result.Error(QueryException("Failed to insert into $thing: ${e.message}"))
-        }
+        val result = sendRpcRequest("insert", paramsJson)
+        Result.Success(json.decodeFromJsonElement(ListSerializer(type.serializer()), result))
+    } catch (e: Exception) {
+        Result.Error(OperationException("Insert failed into $table", e))
     }
 
-    override suspend fun <T : Any> insertRelation(table: RecordId, data: T, type: KClass<T>): Result<T> {
+    suspend inline fun <reified T : Any> insert(table: String, data: List<T>): Result<List<T>> = insert(table, data, T::class)
+
+    suspend fun <T : Any> insertRelation(table: String, data: T, type: KClass<T>): Result<T> = try {
         val paramsJson = buildJsonArray {
-            add(JsonPrimitive(table.toString()))
+            add(JsonPrimitive(table))  // Just the table name, no id
             add(json.encodeToJsonElement(type.serializer(), data))
         }
-        return try {
-            val result = sendRpcRequest("insert_relation", paramsJson)
-            Result.Success(json.decodeFromJsonElement(type.serializer(), result.jsonArray.first()))
-        } catch (e: Exception) {
-            Result.Error(QueryException("Failed to insert relation into $table: ${e.message}"))
-        }
+        val result = sendRpcRequest("insert_relation", paramsJson)
+        Result.Success(json.decodeFromJsonElement(type.serializer(), result.jsonArray.first()))
+    } catch (e: Exception) {
+        Result.Error(OperationException("Insert relation failed into $table", e))
     }
 
-    override suspend fun <T : Any> update(thing: RecordId, data: T, type: KClass<T>): Result<T> {
-        val paramsJson = buildJsonArray {
-            add(JsonPrimitive(thing.toString()))
-            add(json.encodeToJsonElement(type.serializer(), data))
-        }
-        return try {
-            val result = sendRpcRequest("update", paramsJson)
-            Result.Success(json.decodeFromJsonElement(type.serializer(), result.jsonArray.first()))
-        } catch (e: Exception) {
-            Result.Error(QueryException("Failed to update $thing: ${e.message}"))
-        }
-    }
+    suspend inline fun <reified T : Any> insertRelation(table: String, data: T): Result<T> = insertRelation(table, data, T::class)
 
-    override suspend fun <T : Any> upsert(thing: RecordId, data: T, type: KClass<T>): Result<T> {
+    suspend fun <T : Any> update(thing: RecordId, data: T, type: KClass<T>): Result<T> = try {
         val paramsJson = buildJsonArray {
             add(JsonPrimitive(thing.toString()))
             add(json.encodeToJsonElement(type.serializer(), data))
         }
-        return try {
-            val result = sendRpcRequest("upsert", paramsJson)
-            Result.Success(json.decodeFromJsonElement(type.serializer(), result))
-        } catch (e: Exception) {
-            Result.Error(QueryException("Failed to upsert $thing: ${e.message}"))
+        val result = sendRpcRequest("update", paramsJson)
+        val updated = when (result) {
+            is JsonNull -> throw DatabaseException("No record found to update for $thing")
+            is JsonObject -> json.decodeFromJsonElement(type.serializer(), result)
+            is JsonArray -> json.decodeFromJsonElement(type.serializer(), result.first()) // Rare case, for consistency
+            else -> throw DatabaseException("Unexpected response format for update: $result")
         }
+        Result.Success(updated)
+    } catch (e: Exception) {
+        Result.Error(OperationException("Update failed on $thing", e))
     }
 
-    override suspend fun <T : Any> relate(
+    suspend inline fun <reified T : Any> update(thing: RecordId, data: T): Result<T> = update(thing, data, T::class)
+
+    suspend fun <T : Any> upsert(thing: RecordId, data: T, type: KClass<T>): Result<T> = try {
+        val paramsJson = buildJsonArray {
+            add(JsonPrimitive(thing.toString()))
+            add(json.encodeToJsonElement(type.serializer(), data))
+        }
+        val result = sendRpcRequest("upsert", paramsJson)
+        Result.Success(json.decodeFromJsonElement(type.serializer(), result))
+    } catch (e: Exception) {
+        Result.Error(OperationException("Upsert failed on $thing", e))
+    }
+
+    suspend inline fun <reified T : Any> upsert(thing: RecordId, data: T): Result<T> = upsert(thing, data, T::class)
+
+    suspend fun <T : Any> relate(
         inThing: RecordId,
         relation: String,
         outThing: RecordId,
-        data: T?,
+        data: T? = null,
         type: KClass<T>
-    ): Result<T> {
+    ): Result<T> = try {
         val paramsJson = buildJsonArray {
             add(JsonPrimitive(inThing.toString()))
             add(JsonPrimitive(relation))
             add(JsonPrimitive(outThing.toString()))
             add(data?.let { json.encodeToJsonElement(type.serializer(), it) } ?: JsonNull)
         }
-        return try {
-            val result = sendRpcRequest("relate", paramsJson)
-            Result.Success(json.decodeFromJsonElement(type.serializer(), result.jsonArray.first()))
-        } catch (e: Exception) {
-            Result.Error(QueryException("Failed to relate $inThing to $outThing: ${e.message}"))
+        val result = sendRpcRequest("relate", paramsJson)
+        val relation = when (result) {
+            is JsonNull -> throw DatabaseException("No relation created for $inThing to $outThing")
+            is JsonObject -> json.decodeFromJsonElement(type.serializer(), result)
+            is JsonArray -> json.decodeFromJsonElement(type.serializer(), result.first()) // Rare case, for consistency
+            else -> throw DatabaseException("Unexpected response format for relate: $result")
         }
+        Result.Success(relation)
+    } catch (e: Exception) {
+        Result.Error(OperationException("Relate failed from $inThing to $outThing", e))
     }
 
-    override suspend fun <T : Any> merge(thing: RecordId, data: T, type: KClass<T>): Result<T> {
+    suspend inline fun <reified T : Any> relate(
+        inThing: RecordId,
+        relation: String,
+        outThing: RecordId,
+        data: T? = null
+    ): Result<T> = relate(inThing, relation, outThing, data, T::class)
+
+    suspend fun <T : Any> merge(thing: RecordId, data: T, type: KClass<T>): Result<T> = try {
         val paramsJson = buildJsonArray {
             add(JsonPrimitive(thing.toString()))
             add(json.encodeToJsonElement(type.serializer(), data))
         }
-        return try {
-            val result = sendRpcRequest("merge", paramsJson)
-            Result.Success(json.decodeFromJsonElement(type.serializer(), result.jsonArray.first()))
-        } catch (e: Exception) {
-            Result.Error(QueryException("Failed to merge $thing: ${e.message}"))
+        val result = sendRpcRequest("merge", paramsJson)
+        val merged = when (result) {
+            is JsonNull -> throw DatabaseException("No record found to merge for $thing")
+            is JsonObject -> json.decodeFromJsonElement(type.serializer(), result)
+            is JsonArray -> json.decodeFromJsonElement(type.serializer(), result.first()) // Rare case, for consistency
+            else -> throw DatabaseException("Unexpected response format for merge: $result")
         }
+        Result.Success(merged)
+    } catch (e: Exception) {
+        Result.Error(OperationException("Merge failed on $thing", e))
     }
 
-    override suspend fun <T : Any> patch(
+    suspend inline fun <reified T : Any> merge(thing: RecordId, data: T): Result<T> = merge(thing, data, T::class)
+
+    suspend fun <T : Any> patch(
         thing: RecordId,
         patches: List<Patch>,
         diff: Boolean,
         type: KClass<T>
-    ): Result<List<T>> {
+    ): Result<List<T>> = try {
         val paramsJson = buildJsonArray {
             add(JsonPrimitive(thing.toString()))
             add(JsonArray(patches.map { json.encodeToJsonElement(it) }))
             add(JsonPrimitive(diff))
         }
-        return try {
-            val result = sendRpcRequest("patch", paramsJson)
-            Result.Success(json.decodeFromJsonElement(ListSerializer(type.serializer()), result))
-        } catch (e: Exception) {
-            Result.Error(QueryException("Failed to patch $thing: ${e.message}"))
+        val result = sendRpcRequest("patch", paramsJson)
+        val listSerializer = ListSerializer(type.serializer())
+        val patched = when (result) {
+            is JsonNull -> emptyList() // No records patched
+            is JsonObject -> listOf(json.decodeFromJsonElement(type.serializer(), result)) // Single record patched
+            is JsonArray -> json.decodeFromJsonElement(listSerializer, result) // Multiple records or diffs
+            else -> throw DatabaseException("Unexpected response format for patch: $result")
         }
+        Result.Success(patched)
+    } catch (e: Exception) {
+        Result.Error(OperationException("Patch failed on $thing", e))
     }
 
-    override suspend fun <T : Any> delete(thing: RecordId, type: KClass<T>): Result<List<T>> {
+    suspend inline fun <reified T : Any> patch(
+        thing: RecordId,
+        patches: List<Patch>,
+        diff: Boolean
+    ): Result<List<T>> = patch(thing, patches, diff, T::class)
+
+    suspend fun <T : Any> delete(thing: RecordId, type: KClass<T>): Result<List<T>> = try {
         val paramsJson = buildJsonArray { add(JsonPrimitive(thing.toString())) }
-        return try {
-            val result = sendRpcRequest("delete", paramsJson)
-            Result.Success(json.decodeFromJsonElement(ListSerializer(type.serializer()), result))
-        } catch (e: Exception) {
-            Result.Error(QueryException("Failed to delete $thing: ${e.message}"))
+        val result = sendRpcRequest("delete", paramsJson)
+        val listSerializer = ListSerializer(type.serializer())
+        val deleted = when (result) {
+            is JsonNull -> emptyList() // No records deleted
+            is JsonObject -> listOf(json.decodeFromJsonElement(type.serializer(), result)) // Single record deleted
+            is JsonArray -> json.decodeFromJsonElement(listSerializer, result) // Multiple records deleted
+            else -> throw DatabaseException("Unexpected response format for delete: $result")
+        }
+        Result.Success(deleted)
+    } catch (e: Exception) {
+        Result.Error(OperationException("Delete failed on $thing", e))
+    }
+
+    suspend inline fun <reified T : Any> delete(thing: RecordId): Result<List<T>> = delete(thing, T::class)
+}
+
+/**
+ * Represents the result of an operation, either success or failure.
+ */
+sealed class Result<out T> {
+    data class Success<T>(val data: T) : Result<T>()
+    data class Error<T>(val exception: DatabaseException) : Result<T>()
+
+    inline fun <R> map(transform: (T) -> R): Result<R> = when (this) {
+        is Success -> Success(transform(data))
+        is Error -> Error(exception)
+    }
+
+    inline fun onSuccess(block: (T) -> Unit): Result<T> {
+        if (this is Success) block(data)
+        return this
+    }
+}
+
+/**
+ * Utility to extract Result value or throw.
+ */
+fun <T> Result<T>.getOrThrow(): T = when (this) {
+    is Result.Success -> data
+    is Result.Error -> throw exception
+}
+
+/**
+ * Base class for database-related exceptions.
+ */
+open class DatabaseException(message: String, cause: Throwable? = null) : Exception(message, cause)
+
+/**
+ * Exception for query-related errors.
+ */
+class QueryException(message: String, cause: Throwable? = null) : DatabaseException(message, cause)
+
+/**
+ * Exception for authentication-related errors.
+ */
+class AuthenticationException(message: String, cause: Throwable? = null) : DatabaseException(message, cause)
+
+/**
+ * Exception for data manipulation operation errors (e.g., select, create, update).
+ */
+class OperationException(message: String, cause: Throwable? = null) : DatabaseException(message, cause)
+
+/**
+ * Represents a SurrealDB record identifier (table:id).
+ */
+@Serializable
+data class RecordId(val table: String, val id: JsonElement) {
+    constructor(table: String, id: String) : this(table, JsonPrimitive(id))
+    constructor(table: String, id: Number) : this(table, JsonPrimitive(id))
+
+    override fun toString(): String = when (id) {
+        is JsonPrimitive -> "$table:${id.contentOrNull}"
+        else -> "$table:${Json.encodeToString(JsonElement.serializer(), id)}"
+    }
+
+    companion object {
+        fun parse(thing: String): RecordId {
+            val parts = thing.split(":", limit = 2)
+            require(parts.size == 2) { "Invalid record ID: $thing (expected table:id)" }
+            return try {
+                RecordId(parts[0], Json.parseToJsonElement(parts[1]))
+            } catch (e: Exception) {
+                RecordId(parts[0], JsonPrimitive(parts[1]))
+            }
         }
     }
 }
+
+/**
+ * Represents a diff operation for live queries.
+ */
+@Serializable
+data class Diff<T>(
+    val operation: String, // "create", "update", "delete"
+    val path: String?,
+    val value: T?
+)
+
+@Serializable
+sealed class SignInParams {
+    @Serializable
+    data class Root(val user: String, val pass: String) : SignInParams()
+
+    @Serializable
+    data class Namespace(val NS: String, val user: String, val pass: String) : SignInParams()
+
+    @Serializable
+    data class Database(val NS: String, val DB: String, val user: String, val pass: String) : SignInParams()
+
+    @Serializable
+    data class Record(
+        val NS: String,
+        val DB: String,
+        val AC: String,
+        val username: String,
+        val password: String,
+        val additionalVars: Map<String, JsonElement>? = null
+    ) : SignInParams()
+}
+
+@Serializable
+sealed class SignUpParams {
+    @Serializable
+    data class Root(val user: String, val pass: String) : SignUpParams()
+
+    @Serializable
+    data class Namespace(val NS: String, val user: String, val pass: String) : SignUpParams()
+
+    @Serializable
+    data class Database(val NS: String, val DB: String, val user: String, val pass: String) : SignUpParams()
+
+    @Serializable
+    data class Record(
+        val NS: String,
+        val DB: String,
+        val AC: String,
+        val username: String,
+        val password: String,
+        val additionalVars: Map<String, JsonElement>? = null
+    ) : SignUpParams()
+}
+
+/**
+ * Represents a patch operation for modifying records.
+ */
+@Serializable
+data class Patch(
+    val op: String,
+    val path: String,
+    val value: JsonElement?
+)

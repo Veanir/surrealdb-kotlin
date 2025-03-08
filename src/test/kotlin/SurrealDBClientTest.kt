@@ -1,208 +1,306 @@
 package pl.steclab.surrealdb
 
-import io.kotest.core.spec.style.FunSpec
 import io.kotest.matchers.collections.shouldHaveSize
 import io.kotest.matchers.shouldBe
-import io.kotest.matchers.shouldNotBe
 import io.kotest.matchers.types.shouldBeInstanceOf
-import io.mockk.*
-import io.ktor.client.*
-import io.ktor.client.plugins.websocket.*
-import io.ktor.websocket.*
-import kotlinx.coroutines.*
-import kotlinx.coroutines.channels.Channel
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.take
+import kotlinx.coroutines.flow.toList
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.withTimeout
 import kotlinx.serialization.Serializable
-import kotlinx.serialization.json.*
-import kotlin.reflect.KClass
+import kotlinx.serialization.json.JsonElement
+import kotlinx.serialization.json.JsonPrimitive
+import kotlinx.serialization.json.jsonObject
+import kotlinx.serialization.json.jsonPrimitive
+import org.junit.jupiter.api.AfterAll
+import org.junit.jupiter.api.BeforeAll
+import org.junit.jupiter.api.Test
+
 
 @Serializable
 data class User(val name: String, val age: Int)
 
-class SurrealDBClientTest : FunSpec({
-    // Mock setup for unit tests
-    val mockHttpClient = mockk<HttpClient>(relaxed = true)
-    val mockSession = mockk<DefaultClientWebSocketSession>(relaxed = true)
-    val mockSendChannel = mockk<Channel<String>>(relaxed = true)
+class SurrealDBClientTest {
 
-    // Helper to create a testable client with mocks
-    fun createMockClient(): SurrealDBClient {
-        val client = spyk(SurrealDBClient("ws://localhost:8000/rpc"))
-
-        // Mock the HttpClient behavior
-        coEvery { mockHttpClient.webSocket(any(), any(), any()) } coAnswers {
-            thirdArg<suspend DefaultClientWebSocketSession.() -> Unit>().invoke(mockSession)
+    companion object {
+        private val config = SurrealDBClientConfig().apply {
+            url = "ws://localhost:8000/rpc"
+            namespace = "test_namespace"
+            database = "test_database"
+            credentials = SignInParams.Root("root", "root")
+            verboseLogging = true
         }
-        coEvery { mockSendChannel.send(any()) } just Runs
-        coEvery { mockSendChannel.close() } returns true
 
-        // Inject mocks via reflection or modify class if needed (avoiding private field access)
-        return client
-    }
-
-    // Integration test setup
-    val realClient = SurrealDBClient("ws://localhost:8000/rpc")
-
-    beforeSpec {
-        runBlocking { realClient.connect() }
-    }
-
-    afterSpec {
-        runBlocking { realClient.disconnect() }
-    }
-
-    // Unit Tests
-    test("connect should establish WebSocket connection") {
-        val client = createMockClient()
-
-        runBlocking { client.connect() }
-        coVerify { mockHttpClient.webSocket("ws://localhost:8000/rpc", any(), any()) }
-    }
-
-    test("query should return list of results") {
-        val client = createMockClient()
-        val response = buildJsonArray {
-            add(buildJsonObject {
-                put("result", buildJsonArray {
-                    add(buildJsonObject { put("name", "Alice"); put("age", 30) })
-                    add(buildJsonObject { put("name", "Bob"); put("age", 25) })
-                })
-            })
+        @BeforeAll
+        @JvmStatic
+        fun setup() {
+            withSurrealDB(config) {
+                query<Unit>("DELETE user")
+                println("User table cleared")
+            }
         }
-        coEvery { client.sendRpcRequest("query", any()) } returns response
 
-        val result = runBlocking { client.query("SELECT * FROM user", null, User::class, lenient = false) }
-        result.shouldBeInstanceOf<Result.Success<List<User>>>()
-        val users: List<User> = (result as Result.Success<List<User>>).data
+        @AfterAll
+        @JvmStatic
+        fun teardown() {
+            println("Tests completed, resources cleaned up by withSurrealDB")
+        }
+    }
+
+    @Test
+    fun `connect should establish WebSocket connection`() = withSurrealDB(config) {
+        val result = version()
+        result.shouldBeInstanceOf<Result.Success<JsonElement>>()
+        println("Version: ${(result as Result.Success).data}")
+        return@withSurrealDB
+    }
+
+    @Test
+    fun `use should set namespace and database`() = withSurrealDB(config) {
+        val result = use("test_namespace", "test_database")
+        result.shouldBeInstanceOf<Result.Success<JsonElement>>()
+        return@withSurrealDB
+    }
+
+    @Test
+    fun `info should return session info`() = withSurrealDB(config) {
+        val result = info()
+        result.shouldBeInstanceOf<Result.Success<JsonElement>>()
+        return@withSurrealDB
+    }
+
+    @Test
+    fun `signup should create a new user`() = withSurrealDB(config) {
+        val result = signup(SignUpParams.Root("testuser", "testpass"))
+        result.shouldBeInstanceOf<Result.Success<String?>>()
+        return@withSurrealDB
+    }
+
+    @Test
+    fun `signin should authenticate user`() = withSurrealDB(config) {
+        val result = signin(SignInParams.Root("root", "root"))
+        result.shouldBeInstanceOf<Result.Success<String?>>()
+        return@withSurrealDB
+    }
+
+    @Test
+    fun `authenticate should validate token`() = withSurrealDB(config) {
+        val token = signin(SignInParams.Root("root", "root")).getOrThrow()
+        token?.let {
+            val result = authenticate(it)
+            result.shouldBeInstanceOf<Result.Success<Unit>>()
+        }
+        return@withSurrealDB
+    }
+
+    @Test
+    fun `invalidate should clear session`() = withSurrealDB(config) {
+        val result = invalidate()
+        result.shouldBeInstanceOf<Result.Success<Unit>>()
+        return@withSurrealDB
+    }
+
+    @Test
+    fun `let and unset should manage variables`() = withSurrealDB(config) {
+        val setResult = let("testVar", JsonPrimitive("value"))
+        setResult.shouldBeInstanceOf<Result.Success<Unit>>()
+
+        val unsetResult = unset("testVar")
+        unsetResult.shouldBeInstanceOf<Result.Success<Unit>>()
+        return@withSurrealDB
+    }
+
+    @Test
+    fun `query should return list of results`() = withSurrealDB(config) {
+        query<Unit>("DELETE user").getOrThrow()
+        query<User>("CREATE user:alice SET name = 'Alice', age = 30").getOrThrow()
+        query<User>("CREATE user:bob SET name = 'Bob', age = 25").getOrThrow()
+        val users = query<User>("SELECT * FROM user").getOrThrow()
         users.shouldHaveSize(2)
-        users[0] shouldBe User("Alice", 30)
-        users[1] shouldBe User("Bob", 25)
+        users.any { it == User("Alice", 30) } shouldBe true
+        users.any { it == User("Bob", 25) } shouldBe true
+        return@withSurrealDB
     }
 
-    test("querySingle should return single result") {
-        val client = createMockClient()
-        val response = buildJsonArray {
-            add(buildJsonObject {
-                put("result", buildJsonArray {
-                    add(buildJsonObject { put("name", "Alice"); put("age", 30) })
-                })
-            })
-        }
-        coEvery { client.sendRpcRequest("query", any()) } returns response
+    @Test
+    fun `query should return single result with first`() = withSurrealDB(config) {
+        query<User>("CREATE user:charlie SET name = 'Charlie', age = 35")
 
-        val result = runBlocking { client.querySingle("SELECT * FROM user:1", null, User::class, lenient = false) }
-        result.shouldBeInstanceOf<Result.Success<Any>>()
-        val user = (result as Result.Success<Any>).data
-        user shouldBe User("Alice", 30)
+        val user = query<User>("SELECT * FROM user:charlie").getOrThrow().first()
+        user shouldBe User("Charlie", 35)
+        return@withSurrealDB
     }
 
-    test("querySingle should fail with multiple results") {
-        val client = createMockClient()
-        val response = buildJsonArray {
-            add(buildJsonObject {
-                put("result", buildJsonArray {
-                    add(buildJsonObject { put("name", "Alice"); put("age", 30) })
-                    add(buildJsonObject { put("name", "Bob"); put("age", 25) })
-                })
-            })
-        }
-        coEvery { client.sendRpcRequest("query", any()) } returns response
+    @Test
+    fun `query should handle multiple results`() = withSurrealDB(config) {
+        query<Unit>("DELETE user WHERE age > 30")
+        query<User>("CREATE user:multi1 SET name = 'Multi1', age = 40")
+        query<User>("CREATE user:multi2 SET name = 'Multi2', age = 45")
 
-        val result = runBlocking { client.querySingle("SELECT * FROM user", null, User::class, lenient = false) }
-        result.shouldBeInstanceOf<Result.Error<*>>()
-        (result as Result.Error).exception.message shouldBe "Expected one result, got 2"
+        val users = query<User>("SELECT * FROM user WHERE age > 30").getOrThrow()
+        users.shouldHaveSize(2)
+        users.any { it == User("Multi1", 40) } shouldBe true
+        users.any { it == User("Multi2", 45) } shouldBe true
+        return@withSurrealDB
     }
 
-    test("querySingle with lenient mode should return JsonElement on failure") {
-        val client = createMockClient()
-        val rawJson = buildJsonArray {
-            add(buildJsonObject {
-                put("result", buildJsonObject { put("name", "Alice"); put("unexpected", "data") })
-            })
-        }
-        coEvery { client.sendRpcRequest("query", any()) } returns rawJson
+    @Test
+    fun `queryRaw should return raw JSON results`() = withSurrealDB(config) {
+        query<User>("CREATE user:invalid SET name = 'Invalid', unexpected = 'data'")
 
-        val result = runBlocking { client.querySingle("SELECT * FROM user:1", null, User::class, lenient = true) }
-        result.shouldBeInstanceOf<Result.Success<Any>>()
-        val data = (result as Result.Success<Any>).data
-        data.shouldBeInstanceOf<JsonElement>()
-        data.toString() shouldBe rawJson.toString()
+        val result = queryRaw("SELECT * FROM user:invalid").getOrThrow()
+        result.shouldHaveSize(1)
+        val firstResult = result[0].jsonObject
+        firstResult["name"]?.jsonPrimitive?.content shouldBe "Invalid"
+        firstResult["unexpected"]?.jsonPrimitive?.content shouldBe "data"
+        return@withSurrealDB
     }
 
-    test("create should return created record") {
-        val client = createMockClient()
-        val response = buildJsonArray {
-            add(buildJsonObject { put("name", "Alice"); put("age", 30) })
-        }
-        coEvery { client.sendRpcRequest("create", any()) } returns response
-
-        val result = runBlocking { client.create(RecordId("user", "1"), User("Alice", 30), User::class) }
+    @Test
+    fun `graphql should execute query`() = withSurrealDB(config) {
+        create<User>(RecordId("user", "alice"), User("Alice", 18))
+        val result = graphql<User>("query { user(age: 18) { name age } }", null)
         result.shouldBeInstanceOf<Result.Success<User>>()
-        (result as Result.Success<User>).data shouldBe User("Alice", 30)
+        return@withSurrealDB
     }
 
-    test("live should register callback and return queryUuid") {
-        val client = createMockClient()
-        val queryUuid = "live-uuid-123"
-        coEvery { client.sendRpcRequest("live", any()) } returns JsonPrimitive(queryUuid)
-
-        var capturedDiff: Diff<User>? = null
-        val result = runBlocking {
-            client.live("user", diff = false, User::class) { diff ->
-                capturedDiff = diff
-            }
-        }
+    @Test
+    fun `run should execute function`() = withSurrealDB(config) {
+        query<Unit>("DEFINE FUNCTION fn::someFunction(\$param: String) { RETURN \$param; }")
+        val result = run<String>("fn::someFunction", null, listOf(JsonPrimitive("hello")))
         result.shouldBeInstanceOf<Result.Success<String>>()
-        (result as Result.Success<String>).data shouldBe queryUuid
+        val success = result as Result.Success
+        success.data shouldBe "hello"
+        return@withSurrealDB
     }
 
-    // Integration Tests
-    test("integration: query should fetch real data").config(enabled = true) {
-        runBlocking {
-            realClient.querySingle(
-                "CREATE user:alice SET name = 'Alice', age = 30",
-                null,
-                User::class,
-                lenient = false
-            ) // Setup data
+    @Test
+    fun `live with callback should receive updates`() = withSurrealDB(config) {
+        val updates = mutableListOf<Diff<User>>()
+        val queryUuid = live("user", diff = false) { diff ->
+            updates.add(diff)
+        }.getOrThrow()
+        delay(500)
+        create(RecordId("user", "eve"), User("Eve", 28))
+        delay(2000)
+        kill(queryUuid).getOrThrow()
 
-            val result = realClient.query("SELECT * FROM user", null, User::class, lenient = false)
-            result.shouldBeInstanceOf<Result.Success<List<User>>>()
-            val users: List<User> = (result as Result.Success<List<User>>).data
-            users.any { it.name == "Alice" && it.age == 30 } shouldBe true
-        }
+        updates.any { it.value == User("Eve", 28) } shouldBe true
+        println("Callback live updates received: $updates")
+        return@withSurrealDB
     }
 
-    test("integration: querySingle should fetch single record").config(enabled = true) {
-        runBlocking {
-            realClient.querySingle(
-                "CREATE user:bob SET name = 'Bob', age = 25",
-                null,
-                User::class,
-                lenient = false
-            ) // Setup data
-
-            val result = realClient.querySingle("SELECT * FROM user:bob", null, User::class, lenient = false)
-            result.shouldBeInstanceOf<Result.Success<Any>>()
-            val user = (result as Result.Success<Any>).data
-            user shouldBe User("Bob", 25)
-        }
-    }
-
-    test("integration: live query should receive updates").config(enabled = true) {
-        runBlocking {
-            val updates = mutableListOf<Diff<User>>()
-            val result = realClient.live("user", diff = false, User::class) { diff ->
-                updates.add(diff)
+    @Test
+    fun `live with Flow should emit updates`() = runBlocking {
+        withSurrealDB(config) {
+            val updates = withTimeout(5000) {
+                val flow = live<User>("user").getOrThrow()
+                delay(500)
+                launch {
+                    create(RecordId("user", "frank"), User("Frank", 60)).getOrThrow()
+                }
+                flow.take(1).toList()
             }
-            result.shouldBeInstanceOf<Result.Success<String>>()
-            val queryUuid = (result as Result.Success<String>).data
 
-            delay(100) // Wait for subscription
-            realClient.querySingle("CREATE user:charlie SET name = 'Charlie', age = 35", null, User::class, lenient = false)
-            delay(500) // Wait for live update
-
-            updates.any { it.value?.name == "Charlie" && it.value?.age == 35 } shouldBe true
-            realClient.kill(queryUuid) // Cleanup
+            updates.any { it.value == User("Frank", 60) } shouldBe true
+            println("Flow live updates received: $updates")
         }
     }
-})
+
+    @Test
+    fun `select should retrieve records`() = withSurrealDB(config) {
+        create(RecordId("user", "dave"), User("Dave", 50))
+        val users = select<User>(RecordId("user", "dave")).getOrThrow()
+        users.shouldHaveSize(1)
+        users[0] shouldBe User("Dave", 50)
+        return@withSurrealDB
+    }
+
+    @Test
+    fun `create should add a record`() = withSurrealDB(config) {
+        val user = create<User>(RecordId("user", "grace"), User("Grace", 22)).getOrThrow()
+        user shouldBe User("Grace", 22)
+        return@withSurrealDB
+    }
+
+    @Test
+    fun `insert should add multiple records`() = withSurrealDB(config) {
+        val users = listOf(User("Hank", 45), User("Ivy", 33))
+        val result = insert("user", users).getOrThrow()
+        result.shouldHaveSize(2)
+        result.any { it == User("Hank", 45) } shouldBe true
+        return@withSurrealDB
+    }
+
+    @Test
+    fun `insertRelation should create a relation`() = withSurrealDB(config) {
+        create(RecordId("user", "john"), User("John", 30))
+        create(RecordId("user", "jane"), User("Jane", 28))
+        val relation = insertRelation("friend", User("John", 30)).getOrThrow()
+        relation.name shouldBe "John"
+        return@withSurrealDB
+    }
+
+    @Test
+    fun `update should modify a record`() = withSurrealDB(config) {
+        create(RecordId("user", "kate"), User("Kate", 27))
+        val updated = update(RecordId("user", "kate"), User("Kate", 28)).getOrThrow()
+        updated shouldBe User("Kate", 28)
+        return@withSurrealDB
+    }
+
+    @Test
+    fun `upsert should create or update a record`() = withSurrealDB(config) {
+        val upserted = upsert(RecordId("user", "leo"), User("Leo", 35)).getOrThrow()
+        upserted shouldBe User("Leo", 35)
+
+        val updated = upsert(RecordId("user", "leo"), User("Leo", 36)).getOrThrow()
+        updated shouldBe User("Leo", 36)
+        return@withSurrealDB
+    }
+
+    @Test
+    fun `relate should link records`() = withSurrealDB(config) {
+        create(RecordId("user", "mike"), User("Mike", 40))
+        create(RecordId("user", "nina"), User("Nina", 38))
+        val relation = relate<User>(
+            RecordId("user", "mike"),
+            "friend",
+            RecordId("user", "nina"),
+            User("Mike", 40)
+        ).getOrThrow()
+        relation.name shouldBe "Mike"
+        return@withSurrealDB
+    }
+
+    @Test
+    fun `merge should partially update a record`() = withSurrealDB(config) {
+        create(RecordId("user", "olga"), User("Olga", 29))
+        val merged = merge(RecordId("user", "olga"), User("Olga", 30)).getOrThrow()
+        merged shouldBe User("Olga", 30)
+        return@withSurrealDB
+    }
+
+    @Test
+    fun `patch should apply patches to a record`() = withSurrealDB(config) {
+        create(RecordId("user", "paul"), User("Paul", 25))
+        val patches = listOf(Patch("replace", "age", JsonPrimitive(26)))
+        val patched = patch<User>(RecordId("user", "paul"), patches, diff = false).getOrThrow()
+        patched[0].age shouldBe 26
+        return@withSurrealDB
+    }
+
+    @Test
+    fun `delete should remove a record`() = withSurrealDB(config) {
+        create(RecordId("user", "quinn"), User("Quinn", 31))
+        val deleted = delete<User>(RecordId("user", "quinn")).getOrThrow()
+        deleted.shouldHaveSize(1)
+        deleted[0] shouldBe User("Quinn", 31)
+
+        val selectResult = select<User>(RecordId("user", "quinn")).getOrThrow()
+        selectResult.shouldHaveSize(0)
+        return@withSurrealDB
+    }
+}
