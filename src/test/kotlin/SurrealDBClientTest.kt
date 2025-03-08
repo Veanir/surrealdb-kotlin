@@ -1,6 +1,7 @@
 package pl.steclab.surrealdb
 
 import io.kotest.matchers.collections.shouldHaveSize
+import io.kotest.matchers.nulls.shouldNotBeNull
 import io.kotest.matchers.shouldBe
 import io.kotest.matchers.types.shouldBeInstanceOf
 import kotlinx.coroutines.delay
@@ -16,6 +17,7 @@ import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
 import org.junit.jupiter.api.AfterAll
 import org.junit.jupiter.api.BeforeAll
+import org.junit.jupiter.api.BeforeEach
 import org.junit.jupiter.api.Test
 
 
@@ -72,9 +74,35 @@ class SurrealDBClientTest {
     }
 
     @Test
-    fun `signup should create a new user`() = withSurrealDB(config) {
-        val result = signup(SignUpParams.Root("testuser", "testpass"))
+    fun `signup should create a new user and return a valid token`() = withSurrealDB(config) {
+        // Act
+        val result = signup(
+            SignUpParams(
+                NS = "test_namespace",
+                DB = "test_database",
+                AC = "allusers",
+                username = "testuser",
+                password = "testpass",
+                additionalVars = mapOf("email" to JsonPrimitive("test@example.com"))
+            )
+        )
+
+        // Assert
         result.shouldBeInstanceOf<Result.Success<String?>>()
+        val token = result.data
+        token.shouldNotBeNull()
+        println("Signup token: $token")
+
+        // Verify user creation
+        val users = query<Map<String, JsonElement>>("SELECT username, email FROM user WHERE username = 'testuser'").getOrThrow()
+        users.shouldHaveSize(1)
+        val user = users[0]
+        user["username"]?.jsonPrimitive?.content shouldBe "testuser"
+        user["email"]?.jsonPrimitive?.content shouldBe "test@example.com"
+
+        // Verify token usability
+        val authResult = authenticate(token)
+        authResult.shouldBeInstanceOf<Result.Success<Unit>>()
         return@withSurrealDB
     }
 

@@ -723,26 +723,14 @@ sealed class SignInParams {
 }
 
 @Serializable
-sealed class SignUpParams {
-    @Serializable
-    data class Root(val user: String, val pass: String) : SignUpParams()
-
-    @Serializable
-    data class Namespace(val NS: String, val user: String, val pass: String) : SignUpParams()
-
-    @Serializable
-    data class Database(val NS: String, val DB: String, val user: String, val pass: String) : SignUpParams()
-
-    @Serializable
-    data class Record(
-        val NS: String,
-        val DB: String,
-        val AC: String,
-        val username: String,
-        val password: String,
-        val additionalVars: Map<String, JsonElement>? = null
-    ) : SignUpParams()
-}
+data class SignUpParams(
+    val NS: String,
+    val DB: String,
+    val AC: String,
+    val username: String,
+    val password: String,
+    val additionalVars: Map<String, JsonElement>? = null
+)
 
 /**
  * Represents a patch operation for modifying records.

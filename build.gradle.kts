@@ -1,6 +1,8 @@
+
 plugins {
     kotlin("jvm") version "2.0.20"
     id("org.jetbrains.kotlin.plugin.serialization") version "1.9.21"
+    id("maven-publish") // Add Maven Publish plugin
 }
 
 group = "pl.steclab"
@@ -28,6 +30,36 @@ dependencies {
 tasks.test {
     useJUnitPlatform()
 }
+
 kotlin {
     jvmToolchain(21)
+}
+
+// Publishing configuration for JitPack
+publishing {
+    publications {
+        create<MavenPublication>("maven") {
+            groupId = project.group.toString()
+            artifactId = "surrealdb-kotlin"
+            version = project.version.toString()
+
+            from(components["java"]) // Include the main JAR
+
+            // Optionally include sources and Javadoc
+            artifact(tasks.create("sourcesJar", Jar::class) {
+                archiveClassifier.set("sources")
+                from(sourceSets["main"].allSource)
+            })
+
+            artifact(tasks.create("javadocJar", Jar::class) {
+                archiveClassifier.set("javadoc")
+                from(tasks.named("javadoc"))
+            })
+        }
+    }
+}
+
+// Ensure Javadoc task is available (optional, but recommended)
+tasks.withType<Javadoc> {
+    isFailOnError = false // JitPack can fail on strict Javadoc errors, so relax this
 }
