@@ -23,6 +23,8 @@ import kotlinx.serialization.json.*
 import kotlinx.serialization.serializer
 import java.util.concurrent.atomic.AtomicInteger
 import kotlin.reflect.KClass
+import kotlin.time.Duration
+import kotlin.time.Duration.Companion.seconds
 
 /**
  * Configuration for the SurrealDB client.
@@ -32,6 +34,7 @@ data class SurrealDBClientConfig(
     var namespace: String? = null,
     var database: String? = null,
     var credentials: SignInParams? = null,
+    var connectionTimeout: Duration? = null,
     var verboseLogging: Boolean = false
 )
 
@@ -92,7 +95,7 @@ class SurrealDBClient(private val config: SurrealDBClientConfig) {
             }
         }
         try {
-            withTimeout(1000) {
+            withTimeout(config.connectionTimeout?.inWholeMilliseconds ?: 5.seconds.inWholeMilliseconds) {
                 while (webSocketSession == null && connectionJob?.isActive == true) delay(10)
                 if (webSocketSession == null) throw DatabaseException("Connection timed out")
             }
