@@ -15,6 +15,7 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withTimeout
 import kotlinx.serialization.Serializable
+import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonElement
 import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.jsonObject
@@ -22,6 +23,15 @@ import kotlinx.serialization.json.jsonPrimitive
 import org.junit.jupiter.api.AfterAll
 import org.junit.jupiter.api.BeforeAll
 import org.junit.jupiter.api.BeforeEach
+import pl.steclab.surrealdb.client.SurrealDBClientConfig
+import pl.steclab.surrealdb.model.Diff
+import pl.steclab.surrealdb.model.RecordId
+import pl.steclab.surrealdb.model.SignInParams
+import pl.steclab.surrealdb.model.SignUpParams
+import pl.steclab.surrealdb.result.getOrThrow
+import pl.steclab.surrealdb.result.Result
+import pl.steclab.surrealdb.utils.SurrealDBOperations
+import pl.steclab.surrealdb.utils.withSurrealDB
 import java.util.*
 
 @Serializable
@@ -50,6 +60,8 @@ class SurrealDBClientTest : FunSpec() {
             credentials = SignInParams.Root("root", "root")
             verboseLogging = true
         }
+
+        private val json = Json { ignoreUnknownKeys = true }
 
         @BeforeAll
         @JvmStatic
@@ -99,7 +111,8 @@ class SurrealDBClientTest : FunSpec() {
 
     private fun uniqueId(prefix: String) = "$prefix${UUID.randomUUID().toString().substring(0, 8)}"
 
-    private suspend fun SurrealDBClient.createUser(id: String, name: String, age: Int): User {
+    // Add createUser helper as an extension function
+    private suspend fun SurrealDBOperations.createUser(id: String, name: String, age: Int): User {
         return create(RecordId("user", id), User(null, name, age)).getOrThrow()
     }
 
@@ -156,7 +169,7 @@ class SurrealDBClientTest : FunSpec() {
                 result.shouldBeInstanceOf<Result.Success<String?>>()
                 val token = result.data.shouldNotBeNull()
 
-                val payloadJson = json.parseToJsonElement(
+                val payloadJson = json.parseToJsonElement(//Unresolved reference 'json'.
                     String(java.util.Base64.getUrlDecoder().decode(token.split(".")[1]))
                 ).jsonObject
                 val userId = payloadJson["ID"]?.jsonPrimitive?.content ?: throw AssertionError("User ID not found")
@@ -291,24 +304,25 @@ class SurrealDBClientTest : FunSpec() {
 
                     synchronized(updates) {
                         updates.shouldHaveSize(3)
-                        val createDiff = updates.find { it.value?.name == "John" && it.value?.age == 30 }
-                        val updateDiff = updates.find { it.value?.name == "John Updated" && it.value?.age == 31 }
-                        val deleteDiff = updates.find { it.value?.name == "John Updated" && it.value?.age == 31 } // DELETE returns last state
+                        val createDiff = updates[0] // Order-based: first event is CREATE
+                        val updateDiff = updates[1] // Second event is UPDATE
+                        val deleteDiff = updates[2] // Third event is DELETE
 
-                        createDiff.shouldNotBeNull()
-                        createDiff.operation shouldBe "create" // Expecting action to be reflected
+                        createDiff.operation shouldBe "create"
                         createDiff.path shouldBe null
                         createDiff.value shouldBe created
 
-                        updateDiff.shouldNotBeNull()
                         updateDiff.operation shouldBe "update"
                         updateDiff.path shouldBe null
                         updateDiff.value?.id shouldBe RecordId("user", userId)
+                        updateDiff.value?.name shouldBe "John Updated"
+                        updateDiff.value?.age shouldBe 31
 
-                        deleteDiff.shouldNotBeNull()
                         deleteDiff.operation shouldBe "delete"
                         deleteDiff.path shouldBe null
                         deleteDiff.value?.id shouldBe RecordId("user", userId)
+                        deleteDiff.value?.name shouldBe "John Updated"
+                        deleteDiff.value?.age shouldBe 31
                     }
                     println("Callback updates (no diff): $updates")
                     return@withSurrealDB
@@ -378,9 +392,20 @@ class SurrealDBClientTest : FunSpec() {
 
                     synchronized(updates) {
                         updates.forEach { println("Diff update: $it") }
-                        updates.any { it.operation == "add" && it.path == "/name" && it.value?.name == "Pat" } shouldBe true
-                        updates.any { it.operation == "replace" && it.path == "/age" && it.value?.age == 41 } shouldBe true
-                        updates.any { it.operation == "remove" && it.path == "" } shouldBe true // Assuming DELETE is a full removal
+                        updates.shouldHaveSize(3)
+                        updates[0].operation shouldBe "replace" // CREATE sends full object replacement
+                        updates[0].path shouldBe "/"
+                        updates[0].value?.name shouldBe "Pat"
+                        updates[0].value?.age shouldBe 40
+
+                        updates[1].operation shouldBe "replace"
+                        updates[1].path shouldBe "/age"
+                        updates[1].value?.age shouldBe 41
+
+                        updates[2].operation shouldBe "remove"
+                        updates[2].path shouldBe ""
+                        updates[2].value?.name shouldBe "Pat"
+                        updates[2].value?.age shouldBe 41
                     }
                     println("Callback updates (diff): $updates")
                     return@withSurrealDB

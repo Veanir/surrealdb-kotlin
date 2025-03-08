@@ -6,6 +6,7 @@ import kotlinx.serialization.descriptors.PrimitiveSerialDescriptor
 import kotlinx.serialization.encoding.Decoder
 import kotlinx.serialization.encoding.Encoder
 import kotlinx.serialization.json.*
+import pl.steclab.surrealdb.model.RecordId
 import java.math.BigDecimal
 import java.time.OffsetDateTime
 import java.time.format.DateTimeFormatter
