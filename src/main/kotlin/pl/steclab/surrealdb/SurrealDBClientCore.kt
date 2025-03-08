@@ -12,8 +12,13 @@ import kotlinx.coroutines.channels.onFailure
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.callbackFlow
 import kotlinx.serialization.InternalSerializationApi
+import kotlinx.serialization.KSerializer
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.builtins.ListSerializer
+import kotlinx.serialization.descriptors.PrimitiveKind
+import kotlinx.serialization.descriptors.PrimitiveSerialDescriptor
+import kotlinx.serialization.encoding.Decoder
+import kotlinx.serialization.encoding.Encoder
 import kotlinx.serialization.json.*
 import kotlinx.serialization.serializer
 import java.util.concurrent.atomic.AtomicInteger
@@ -86,14 +91,13 @@ class SurrealDBClient(private val config: SurrealDBClientConfig) {
                 }
             }
         }
-        // Wait for connection to establish with a timeout
         try {
             withTimeout(1000) {
                 while (webSocketSession == null && connectionJob?.isActive == true) delay(10)
                 if (webSocketSession == null) throw DatabaseException("Connection timed out")
             }
         } catch (e: TimeoutCancellationException) {
-            disconnect() // Cleanup on timeout
+            disconnect()
             throw DatabaseException("Failed to connect to ${config.url}: Timeout", e)
         }
     }
@@ -103,7 +107,7 @@ class SurrealDBClient(private val config: SurrealDBClientConfig) {
             connectionJob?.let {
                 if (it.isActive) {
                     it.cancel("Disconnecting client")
-                    it.join() // Wait for cancellation to complete
+                    it.join()
                 }
             }
             webSocketSession?.close(CloseReason(CloseReason.Codes.NORMAL, "Client disconnect"))
@@ -352,9 +356,19 @@ class SurrealDBClient(private val config: SurrealDBClientConfig) {
         val result = sendRpcRequest("query", paramsJson)
         if (result !is JsonArray) throw QueryException("Expected array, got $result")
         val listSerializer = ListSerializer(type.serializer())
-        val results = result.mapNotNull { it.jsonObject["result"] }
-            .map { json.decodeFromJsonElement(listSerializer, it) }
-            .flatten()
+        val results = result.mapNotNull { it.jsonObject }.map { response ->
+            val status = response["status"]?.jsonPrimitive?.content
+            val resultData = response["result"]
+            if (status == "ERR") {
+                val errorMessage = resultData?.jsonPrimitive?.content ?: "Unknown error"
+                throw QueryException("Query execution failed: $errorMessage")
+            }
+            // Handle null result for Unit type queries (e.g., DEFINE FUNCTION)
+            if (type == Unit::class && resultData is JsonNull) null else resultData
+        }.map {
+            if (it == null && type == Unit::class) emptyList() // Return empty list for Unit success
+            else json.decodeFromJsonElement(listSerializer, it ?: throw QueryException("Unexpected null result for non-Unit type"))
+        }.flatten()
         Result.Success(results)
     } catch (e: Exception) {
         Result.Error(QueryException("Query failed: $sql with vars $vars", e))
@@ -375,13 +389,18 @@ class SurrealDBClient(private val config: SurrealDBClientConfig) {
         }
         val result = sendRpcRequest("query", paramsJson)
         if (result !is JsonArray) throw QueryException("Expected array, got $result")
-        val rawResults = result.mapNotNull { it.jsonObject["result"] }
-            .flatMap {
-                when (it) {
-                    is JsonArray -> it.toList()  // If "result" is an array, expand it
-                    else -> listOf(it)           // If "result" is a single element, wrap it in a list
-                }
+        val rawResults = result.mapNotNull { it.jsonObject }.flatMap { response ->
+            val status = response["status"]?.jsonPrimitive?.content
+            val resultData = response["result"]
+            if (status == "ERR") {
+                val errorMessage = resultData?.jsonPrimitive?.content ?: "Unknown error"
+                throw QueryException("Raw query execution failed: $errorMessage")
             }
+            when (resultData) {
+                is JsonArray -> resultData.toList()
+                else -> listOf(resultData)
+            }
+        }.filterNotNull()
         Result.Success(rawResults)
     } catch (e: Exception) {
         Result.Error(QueryException("Raw query failed: $sql with vars $vars", e))
@@ -435,13 +454,13 @@ class SurrealDBClient(private val config: SurrealDBClientConfig) {
         val paramsJson = buildJsonArray { add(JsonPrimitive(thing.toString())) }
         val result = sendRpcRequest("select", paramsJson)
         val listSerializer = ListSerializer(type.serializer())
-        val users = when (result) {
-            is JsonNull -> emptyList() // No records found
-            is JsonObject -> listOf(json.decodeFromJsonElement(type.serializer(), result)) // Single record
-            is JsonArray -> json.decodeFromJsonElement(listSerializer, result) // Multiple records
+        val records = when (result) {
+            is JsonNull -> emptyList()
+            is JsonObject -> listOf(json.decodeFromJsonElement(type.serializer(), result))
+            is JsonArray -> json.decodeFromJsonElement(listSerializer, result)
             else -> throw DatabaseException("Unexpected response format for select: $result")
         }
-        Result.Success(users)
+        Result.Success(records)
     } catch (e: Exception) {
         Result.Error(OperationException("Select failed on $thing", e))
     }
@@ -454,7 +473,12 @@ class SurrealDBClient(private val config: SurrealDBClientConfig) {
             add(data?.let { json.encodeToJsonElement(type.serializer(), it) } ?: JsonNull)
         }
         val result = sendRpcRequest("create", paramsJson)
-        Result.Success(json.decodeFromJsonElement(type.serializer(), if (result is JsonArray) result.first() else result))
+        val created = when (result) {
+            is JsonArray -> json.decodeFromJsonElement(type.serializer(), result.first())
+            is JsonObject -> json.decodeFromJsonElement(type.serializer(), result)
+            else -> throw DatabaseException("Unexpected response format for create: $result")
+        }
+        Result.Success(created)
     } catch (e: Exception) {
         Result.Error(OperationException("Create failed on $thing", e))
     }
@@ -463,7 +487,7 @@ class SurrealDBClient(private val config: SurrealDBClientConfig) {
 
     suspend fun <T : Any> insert(table: String, data: List<T>, type: KClass<T>): Result<List<T>> = try {
         val paramsJson = buildJsonArray {
-            add(JsonPrimitive(table))  // Just the table name, no id
+            add(JsonPrimitive(table))
             add(JsonArray(data.map { json.encodeToJsonElement(type.serializer(), it) }))
         }
         val result = sendRpcRequest("insert", paramsJson)
@@ -476,7 +500,7 @@ class SurrealDBClient(private val config: SurrealDBClientConfig) {
 
     suspend fun <T : Any> insertRelation(table: String, data: T, type: KClass<T>): Result<T> = try {
         val paramsJson = buildJsonArray {
-            add(JsonPrimitive(table))  // Just the table name, no id
+            add(JsonPrimitive(table))
             add(json.encodeToJsonElement(type.serializer(), data))
         }
         val result = sendRpcRequest("insert_relation", paramsJson)
@@ -496,7 +520,7 @@ class SurrealDBClient(private val config: SurrealDBClientConfig) {
         val updated = when (result) {
             is JsonNull -> throw DatabaseException("No record found to update for $thing")
             is JsonObject -> json.decodeFromJsonElement(type.serializer(), result)
-            is JsonArray -> json.decodeFromJsonElement(type.serializer(), result.first()) // Rare case, for consistency
+            is JsonArray -> json.decodeFromJsonElement(type.serializer(), result.first())
             else -> throw DatabaseException("Unexpected response format for update: $result")
         }
         Result.Success(updated)
@@ -533,13 +557,13 @@ class SurrealDBClient(private val config: SurrealDBClientConfig) {
             add(data?.let { json.encodeToJsonElement(type.serializer(), it) } ?: JsonNull)
         }
         val result = sendRpcRequest("relate", paramsJson)
-        val relation = when (result) {
+        val relationData = when (result) {
             is JsonNull -> throw DatabaseException("No relation created for $inThing to $outThing")
             is JsonObject -> json.decodeFromJsonElement(type.serializer(), result)
-            is JsonArray -> json.decodeFromJsonElement(type.serializer(), result.first()) // Rare case, for consistency
+            is JsonArray -> json.decodeFromJsonElement(type.serializer(), result.first())
             else -> throw DatabaseException("Unexpected response format for relate: $result")
         }
-        Result.Success(relation)
+        Result.Success(relationData)
     } catch (e: Exception) {
         Result.Error(OperationException("Relate failed from $inThing to $outThing", e))
     }
@@ -560,7 +584,7 @@ class SurrealDBClient(private val config: SurrealDBClientConfig) {
         val merged = when (result) {
             is JsonNull -> throw DatabaseException("No record found to merge for $thing")
             is JsonObject -> json.decodeFromJsonElement(type.serializer(), result)
-            is JsonArray -> json.decodeFromJsonElement(type.serializer(), result.first()) // Rare case, for consistency
+            is JsonArray -> json.decodeFromJsonElement(type.serializer(), result.first())
             else -> throw DatabaseException("Unexpected response format for merge: $result")
         }
         Result.Success(merged)
@@ -584,9 +608,9 @@ class SurrealDBClient(private val config: SurrealDBClientConfig) {
         val result = sendRpcRequest("patch", paramsJson)
         val listSerializer = ListSerializer(type.serializer())
         val patched = when (result) {
-            is JsonNull -> emptyList() // No records patched
-            is JsonObject -> listOf(json.decodeFromJsonElement(type.serializer(), result)) // Single record patched
-            is JsonArray -> json.decodeFromJsonElement(listSerializer, result) // Multiple records or diffs
+            is JsonNull -> emptyList()
+            is JsonObject -> listOf(json.decodeFromJsonElement(type.serializer(), result))
+            is JsonArray -> json.decodeFromJsonElement(listSerializer, result)
             else -> throw DatabaseException("Unexpected response format for patch: $result")
         }
         Result.Success(patched)
@@ -605,9 +629,9 @@ class SurrealDBClient(private val config: SurrealDBClientConfig) {
         val result = sendRpcRequest("delete", paramsJson)
         val listSerializer = ListSerializer(type.serializer())
         val deleted = when (result) {
-            is JsonNull -> emptyList() // No records deleted
-            is JsonObject -> listOf(json.decodeFromJsonElement(type.serializer(), result)) // Single record deleted
-            is JsonArray -> json.decodeFromJsonElement(listSerializer, result) // Multiple records deleted
+            is JsonNull -> emptyList()
+            is JsonObject -> listOf(json.decodeFromJsonElement(type.serializer(), result))
+            is JsonArray -> json.decodeFromJsonElement(listSerializer, result)
             else -> throw DatabaseException("Unexpected response format for delete: $result")
         }
         Result.Success(deleted)
@@ -667,26 +691,36 @@ class OperationException(message: String, cause: Throwable? = null) : DatabaseEx
 /**
  * Represents a SurrealDB record identifier (table:id).
  */
-@Serializable
-data class RecordId(val table: String, val id: JsonElement) {
-    constructor(table: String, id: String) : this(table, JsonPrimitive(id))
-    constructor(table: String, id: Number) : this(table, JsonPrimitive(id))
+@Serializable(with = RecordIdSerializer::class)
+data class RecordId(val table: String, val id: String) {
+    constructor(table: String, id: JsonElement) : this(
+        table,
+        when (id) {
+            is JsonPrimitive -> id.content
+            else -> id.toString()
+        }
+    )
 
-    override fun toString(): String = when (id) {
-        is JsonPrimitive -> "$table:${id.contentOrNull}"
-        else -> "$table:${Json.encodeToString(JsonElement.serializer(), id)}"
-    }
+    override fun toString(): String = "$table:$id"
 
     companion object {
         fun parse(thing: String): RecordId {
             val parts = thing.split(":", limit = 2)
             require(parts.size == 2) { "Invalid record ID: $thing (expected table:id)" }
-            return try {
-                RecordId(parts[0], Json.parseToJsonElement(parts[1]))
-            } catch (e: Exception) {
-                RecordId(parts[0], JsonPrimitive(parts[1]))
-            }
+            return RecordId(parts[0], parts[1])
         }
+    }
+}
+
+object RecordIdSerializer : KSerializer<RecordId> {
+    override val descriptor = PrimitiveSerialDescriptor("RecordId", PrimitiveKind.STRING)
+
+    override fun serialize(encoder: Encoder, value: RecordId) {
+        encoder.encodeString(value.toString())
+    }
+
+    override fun deserialize(decoder: Decoder): RecordId {
+        return RecordId.parse(decoder.decodeString())
     }
 }
 
@@ -695,7 +729,7 @@ data class RecordId(val table: String, val id: JsonElement) {
  */
 @Serializable
 data class Diff<T>(
-    val operation: String, // "create", "update", "delete"
+    val operation: String,
     val path: String?,
     val value: T?
 )
