@@ -161,12 +161,15 @@ The `SurrealDBClientConfig` class supports the following options:
 ## Running Tests
 The project includes a comprehensive test suite. Ensure SurrealDB is running locally:
 ```bash
-docker run --rm -p 8000:8000 surrealdb/surrealdb:latest start --user root --pass root
+docker run --rm -p 8000:8000 -e SURREAL_CAPS_ALLOW_EXPERIMENTAL=graphql surrealdb/surrealdb:latest start --user root --pass root --allow-all
 ```
 Then run the tests:
 ```bash
 ./gradlew test
 ```
+
+## TODO
+- 3/26 tests are still failing
 
 ## Contributing
 Contributions are welcome! Please:
