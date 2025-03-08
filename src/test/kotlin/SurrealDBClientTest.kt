@@ -270,38 +270,151 @@ class SurrealDBClientTest : FunSpec() {
             }
         }
 
-        test("live with callback should receive updates") {
-            withSurrealDB(config) {
-                val updates = mutableListOf<Diff<User>>()
-                val queryUuid = live("user", diff = false) { diff ->
-                    updates.add(diff)
-                }.getOrThrow()
-                delay(100)
-                createUser(uniqueId("eve"), "Eve", 28)
-                delay(500)
-                kill(queryUuid).getOrThrow()
-                updates.any { it.value?.name == "Eve" && it.value?.age == 28 } shouldBe true
-                println("Callback updates: $updates")
-                return@withSurrealDB
-            }
-        }
-
-        test("live with Flow should emit updates") {
-            runBlocking {
+        context("live query tests") {
+            test("live with callback should handle CREATE, UPDATE, DELETE without diff") {
                 withSurrealDB(config) {
-                    val flow = live<User>("user").getOrThrow()
                     val updates = mutableListOf<Diff<User>>()
-                    launch {
-                        delay(100)
-                        createUser(uniqueId("frank"), "Frank", 60)
+                    val queryUuid = live("user", diff = false) { diff ->
+                        synchronized(updates) { updates.add(diff) }
+                    }.getOrThrow()
+
+                    delay(100) // Wait for subscription
+                    val userId = uniqueId("john")
+                    val created = createUser(userId, "John", 30)
+                    delay(100)
+                    update(RecordId("user", userId), User(null, "John Updated", 31)).getOrThrow()
+                    delay(100)
+                    delete<User>(RecordId("user", userId)).getOrThrow()
+                    delay(500) // Ensure all notifications are received
+
+                    kill(queryUuid).getOrThrow()
+
+                    synchronized(updates) {
+                        updates.shouldHaveSize(3)
+                        val createDiff = updates.find { it.value?.name == "John" && it.value?.age == 30 }
+                        val updateDiff = updates.find { it.value?.name == "John Updated" && it.value?.age == 31 }
+                        val deleteDiff = updates.find { it.value?.name == "John Updated" && it.value?.age == 31 } // DELETE returns last state
+
+                        createDiff.shouldNotBeNull()
+                        createDiff.operation shouldBe "create" // Expecting action to be reflected
+                        createDiff.path shouldBe null
+                        createDiff.value shouldBe created
+
+                        updateDiff.shouldNotBeNull()
+                        updateDiff.operation shouldBe "update"
+                        updateDiff.path shouldBe null
+                        updateDiff.value?.id shouldBe RecordId("user", userId)
+
+                        deleteDiff.shouldNotBeNull()
+                        deleteDiff.operation shouldBe "delete"
+                        deleteDiff.path shouldBe null
+                        deleteDiff.value?.id shouldBe RecordId("user", userId)
                     }
-                    withTimeout(1000) {
-                        flow.take(1).toList(updates)
-                    }
-                    updates.shouldHaveSize(1)
-                    updates[0].value shouldBe User(updates[0].value?.id, "Frank", 60)
-                    println("Flow updates: $updates")
+                    println("Callback updates (no diff): $updates")
                     return@withSurrealDB
+                }
+            }
+
+            test("live with Flow should handle CREATE, UPDATE, DELETE without diff") {
+                runBlocking {
+                    withSurrealDB(config) {
+                        val flow = live<User>("user", diff = false).getOrThrow()
+                        val updates = mutableListOf<Diff<User>>()
+
+                        launch {
+                            delay(100)
+                            val userId = uniqueId("mary")
+                            createUser(userId, "Mary", 25)
+                            delay(100)
+                            update(RecordId("user", userId), User(null, "Mary Updated", 26)).getOrThrow()
+                            delay(100)
+                            delete<User>(RecordId("user", userId)).getOrThrow()
+                        }
+
+                        withTimeout(1000) {
+                            flow.take(3).toList(updates)
+                        }
+
+                        updates.shouldHaveSize(3)
+                        val createDiff = updates[0]
+                        val updateDiff = updates[1]
+                        val deleteDiff = updates[2]
+
+                        createDiff.operation shouldBe "create"
+                        createDiff.value?.name shouldBe "Mary"
+                        createDiff.value?.age shouldBe 25
+
+                        updateDiff.operation shouldBe "update"
+                        updateDiff.value?.name shouldBe "Mary Updated"
+                        updateDiff.value?.age shouldBe 26
+
+                        deleteDiff.operation shouldBe "delete"
+                        deleteDiff.value?.name shouldBe "Mary Updated"
+                        deleteDiff.value?.age shouldBe 26
+
+                        println("Flow updates (no diff): $updates")
+                        return@withSurrealDB
+                    }
+                }
+            }
+
+            test("live with callback should handle diff mode") {
+                withSurrealDB(config) {
+                    val updates = mutableListOf<Diff<User>>()
+                    val queryUuid = live("user", diff = true) { diff ->
+                        synchronized(updates) { updates.add(diff) }
+                    }.getOrThrow()
+
+                    delay(100)
+                    val userId = uniqueId("pat")
+                    createUser(userId, "Pat", 40)
+                    delay(100)
+                    update(RecordId("user", userId), User(null, "Pat", 41)).getOrThrow()
+                    delay(100)
+                    delete<User>(RecordId("user", userId)).getOrThrow()
+                    delay(500)
+
+                    kill(queryUuid).getOrThrow()
+
+                    synchronized(updates) {
+                        updates.forEach { println("Diff update: $it") }
+                        updates.any { it.operation == "add" && it.path == "/name" && it.value?.name == "Pat" } shouldBe true
+                        updates.any { it.operation == "replace" && it.path == "/age" && it.value?.age == 41 } shouldBe true
+                        updates.any { it.operation == "remove" && it.path == "" } shouldBe true // Assuming DELETE is a full removal
+                    }
+                    println("Callback updates (diff): $updates")
+                    return@withSurrealDB
+                }
+            }
+
+            test("live with Flow should handle diff mode") {
+                runBlocking {
+                    withSurrealDB(config) {
+                        val flow = live<User>("user", diff = true).getOrThrow()
+                        val updates = mutableListOf<Diff<User>>()
+
+                        launch {
+                            delay(100)
+                            val userId = uniqueId("sam")
+                            createUser(userId, "Sam", 50)
+                            delay(100)
+                            update(RecordId("user", userId), User(null, "Sam", 51)).getOrThrow()
+                            delay(100)
+                            delete<User>(RecordId("user", userId)).getOrThrow()
+                        }
+
+                        withTimeout(1000) {
+                            flow.take(3).toList(updates) // Adjust based on actual patch count
+                        }
+
+                        updates.forEach { println("Diff Flow update: $it") }
+                        updates.any { it.operation == "add" && it.path == "/name" && it.value?.name == "Sam" } shouldBe true
+                        updates.any { it.operation == "replace" && it.path == "/age" && it.value?.age == 51 } shouldBe true
+                        updates.any { it.operation == "remove" && it.path == "" } shouldBe true
+
+                        println("Flow updates (diff): $updates")
+                        return@withSurrealDB
+                    }
                 }
             }
         }
